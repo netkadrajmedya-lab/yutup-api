@@ -55,47 +55,90 @@ const FALLBACK_APIS = [
     "https://api.cobalt.blackcat.sweeux.org"
 ];
 
-// Alternatif indirme sunucularını deneyen yardımcı fonksiyon
+// Alternatif indirme sunucularını deneyen yardımcı fonksiyon (Eski Node sürümlerinde patlamaması için tamamen saf https ile yazıldı)
 function tryCobaltDownload(videoUrl, format, quality = '1080') {
-    return new Promise(async (resolve, reject) => {
-        const payload = {
+    return new Promise((resolve, reject) => {
+        const payload = JSON.stringify({
             url: videoUrl,
             audioFormat: format === 'mp3' ? 'mp3' : 'best',
             downloadMode: format === 'mp3' ? 'audio' : 'auto',
             videoQuality: quality,
             youtubeVideoCodec: 'h264'
-        };
+        });
 
-        for (const api of FALLBACK_APIS) {
+        let currentApiIndex = 0;
+
+        function attemptNext() {
+            if (currentApiIndex >= FALLBACK_APIS.length) {
+                return reject(new Error('Tüm alternatif indirme sunucuları başarısız oldu.'));
+            }
+
+            const api = FALLBACK_APIS[currentApiIndex];
+            currentApiIndex++;
+
+            console.log(`[Sistem] Cobalt alternatifi deneniyor: ${api}`);
+
             try {
-                console.log(`[Sistem] Cobalt alternatifi deneniyor: ${api}`);
-                const response = await fetch(api, {
+                const urlObj = new URL(api);
+                const options = {
+                    hostname: urlObj.hostname,
+                    port: urlObj.port || 443,
+                    path: urlObj.pathname === '/' ? '/' : urlObj.pathname,
                     method: 'POST',
                     headers: {
                         'Accept': 'application/json',
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        'Content-Length': Buffer.byteLength(payload)
                     },
-                    body: JSON.stringify(payload),
-                    signal: AbortSignal.timeout(12000) // 12 saniye zaman aşımı
+                    timeout: 12000 // 12 saniye zaman aşımı
+                };
+
+                const req = https.request(options, (res) => {
+                    let dataStr = '';
+                    res.on('data', (chunk) => { dataStr += chunk; });
+                    res.on('end', () => {
+                        if (res.statusCode < 200 || res.statusCode >= 300) {
+                            console.warn(`[Sistem] ${api} yanıt hatası: ${res.statusCode}`);
+                            return attemptNext();
+                        }
+
+                        try {
+                            const data = JSON.parse(dataStr);
+                            if (data && (data.status === 'tunnel' || data.status === 'redirect') && data.url) {
+                                console.log(`[Sistem] Cobalt indirme linki başarıyla alındı!`);
+                                return resolve({ downloadUrl: data.url, filename: data.filename || 'yutup_indir' });
+                            } else {
+                                console.warn(`[Sistem] ${api} geçersiz yanıt yapısı:`, data);
+                                attemptNext();
+                            }
+                        } catch (parseErr) {
+                            console.warn(`[Sistem] ${api} JSON ayrıştırma hatası:`, parseErr.message);
+                            attemptNext();
+                        }
+                    });
                 });
 
-                if (!response.ok) {
-                    console.warn(`[Sistem] ${api} yanıt hatası: ${response.status}`);
-                    continue;
-                }
+                req.on('error', (err) => {
+                    console.warn(`[Sistem] ${api} bağlantı hatası:`, err.message);
+                    attemptNext();
+                });
 
-                const data = await response.json();
-                if (data && (data.status === 'tunnel' || data.status === 'redirect') && data.url) {
-                    console.log(`[Sistem] Cobalt indirme linki başarıyla alındı!`);
-                    return resolve({ downloadUrl: data.url, filename: data.filename || 'yutup_indir' });
-                } else {
-                    console.warn(`[Sistem] ${api} geçersiz yanıt yapısı:`, data);
-                }
+                req.on('timeout', () => {
+                    console.warn(`[Sistem] ${api} zaman aşımına uğradı.`);
+                    req.destroy();
+                    attemptNext();
+                });
+
+                req.write(payload);
+                req.end();
+
             } catch (err) {
-                console.warn(`[Sistem] ${api} bağlantı hatası:`, err.message);
+                console.warn(`[Sistem] URL ayrıştırma hatası (${api}):`, err.message);
+                attemptNext();
             }
         }
-        reject(new Error('Tüm alternatif indirme sunucuları başarısız oldu.'));
+
+        attemptNext();
     });
 }
 
