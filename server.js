@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 const { spawn } = require('child_process');
 const youtubedlPath = require('youtube-dl-exec').constants.YOUTUBE_DL_PATH;
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
@@ -40,6 +41,60 @@ const PORT = process.env.PORT || 3000;
 // CORS izinleri ve public klasörünü statik olarak sunma
 app.use(cors());
 app.use(express.static('public'));
+
+// Alternatif yüksek performanslı, coğrafi dağıtık YouTube indirme motoru listesi (Render IP engellemesini aşmak için)
+const FALLBACK_APIS = [
+    "https://cobaltapi.squair.xyz",
+    "https://api.dl.woof.monster",
+    "https://cobaltapi.kittycat.boo",
+    "https://fox.kittycat.boo",
+    "https://dog.kittycat.boo",
+    "https://api.cobalt.blackcat.sweeux.org"
+];
+
+// Alternatif indirme sunucularını deneyen yardımcı fonksiyon
+function tryCobaltDownload(videoUrl, format) {
+    return new Promise(async (resolve, reject) => {
+        const payload = {
+            url: videoUrl,
+            audioFormat: format === 'mp3' ? 'mp3' : 'best',
+            downloadMode: format === 'mp3' ? 'audio' : 'auto',
+            videoQuality: '1080',
+            youtubeVideoCodec: 'h264'
+        };
+
+        for (const api of FALLBACK_APIS) {
+            try {
+                console.log(`[Sistem] Cobalt alternatifi deneniyor: ${api}`);
+                const response = await fetch(api, {
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload),
+                    signal: AbortSignal.timeout(12000) // 12 saniye zaman aşımı
+                });
+
+                if (!response.ok) {
+                    console.warn(`[Sistem] ${api} yanıt hatası: ${response.status}`);
+                    continue;
+                }
+
+                const data = await response.json();
+                if (data && (data.status === 'tunnel' || data.status === 'redirect') && data.url) {
+                    console.log(`[Sistem] Cobalt indirme linki başarıyla alındı!`);
+                    return resolve({ downloadUrl: data.url, filename: data.filename || 'yutup_indir' });
+                } else {
+                    console.warn(`[Sistem] ${api} geçersiz yanıt yapısı:`, data);
+                }
+            } catch (err) {
+                console.warn(`[Sistem] ${api} bağlantı hatası:`, err.message);
+            }
+        }
+        reject(new Error('Tüm alternatif indirme sunucuları başarısız oldu.'));
+    });
+}
 
 // Dosya isminde hata yaratabilecek karakterleri temizleme fonksiyonu
 function sanitizeFilename(name) {
@@ -125,26 +180,58 @@ app.get('/api/download', async (req, res) => {
             ];
         }
 
-        console.log(`İndirme başlatıldı: ${safeTitle}`);
-        // yt-dlp binary'sini doğrudan ham argümanlarla tetikliyoruz
-        await runYtDlp(videoUrl, dlArgs);
-        console.log(`İndirme ve dönüştürme bitti. İstemciye aktarılıyor...`);
+        try {
+            console.log(`İndirme başlatıldı (Yerel): ${safeTitle}`);
+            // yt-dlp binary'sini doğrudan ham argümanlarla tetikliyoruz
+            await runYtDlp(videoUrl, dlArgs);
+            console.log(`İndirme ve dönüştürme bitti. İstemciye aktarılıyor...`);
 
-        // Dosyayı İstemciye (Kullanıcıya) Gönder
-        res.download(outputPath, `${safeTitle}.${format}`, (err) => {
-            if (err) {
-                console.error('Dosya gönderim hatası:', err);
-            }
-            // Sunucuda yer kaplamaması için gönderildikten sonra dosyayı sil
-            fs.unlink(outputPath, (unlinkErr) => {
-                if (unlinkErr) console.error('Geçici dosya silinemedi:', unlinkErr);
-                else console.log('Geçici dosya sunucudan temizlendi.');
+            // Dosyayı İstemciye (Kullanıcıya) Gönder
+            res.download(outputPath, `${safeTitle}.${format}`, (err) => {
+                if (err) {
+                    console.error('Dosya gönderim hatası:', err);
+                }
+                // Sunucuda yer kaplamaması için gönderildikten sonra dosyayı sil
+                fs.unlink(outputPath, (unlinkErr) => {
+                    if (unlinkErr) console.error('Geçici dosya silinemedi:', unlinkErr);
+                    else console.log('Geçici dosya sunucudan temizlendi.');
+                });
             });
-        });
-
-    } catch (error) {
-        console.error('Sunucu veya dönüştürme hatası:', error);
-        res.status(500).send('Video indirilirken bir hata oluştu. Link engellenmiş veya kısıtlı olabilir.');
+        } catch (downloadError) {
+            console.warn('[Sistem] Yerel indirme (yt-dlp) başarısız oldu, alternatif (Cobalt Proxy) deneniyor...', downloadError.message);
+            
+            try {
+                const cobaltResult = await tryCobaltDownload(videoUrl, format);
+                console.log(`[Sistem] Alternatif indirme akışı başlatılıyor: ${cobaltResult.filename}`);
+                
+                const clientFilename = sanitizeFilename(cobaltResult.filename);
+                
+                https.get(cobaltResult.downloadUrl, (cobaltStream) => {
+                    if (cobaltStream.statusCode >= 400) {
+                        return res.status(cobaltStream.statusCode).send('Alternatif akış indirme hatası.');
+                    }
+                    
+                    res.setHeader('Content-Disposition', `attachment; filename="${clientFilename || safeTitle}.${format}"`);
+                    res.setHeader('Content-Type', format === 'mp3' ? 'audio/mpeg' : 'video/mp4');
+                    
+                    cobaltStream.pipe(res);
+                    
+                    cobaltStream.on('end', () => {
+                        console.log('[Sistem] Alternatif dosya başarıyla akıtıldı ve tamamlandı.');
+                    });
+                }).on('error', (streamErr) => {
+                    console.error('[Sistem] Alternatif akış hatası:', streamErr);
+                    res.status(500).send('Alternatif indirme akışı sırasında hata oluştu.');
+                });
+                
+            } catch (fallbackError) {
+                console.error('[Sistem] Tüm indirme metotları başarısız oldu:', fallbackError.message);
+                res.status(500).send('Video indirilirken bir hata oluştu. Link engellenmiş veya kısıtlı olabilir.');
+            }
+        }
+    } catch (outerError) {
+        console.error('[Sistem] Beklenmeyen sunucu hatası:', outerError);
+        res.status(500).send('Sunucu tarafında beklenmedik bir hata oluştu.');
     }
 });
 
