@@ -39,7 +39,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // CORS izinleri ve public klasörünü statik olarak sunma
-app.use(cors());
+// Tarayıcının Content-Disposition header'ına erişebilmesi ve orijinal dosya adını alabilmesi için expose ediyoruz
+app.use(cors({
+    exposedHeaders: ['Content-Disposition']
+}));
 app.use(express.static('public'));
 
 // Alternatif yüksek performanslı, coğrafi dağıtık YouTube indirme motoru listesi (Render IP engellemesini aşmak için)
@@ -53,13 +56,13 @@ const FALLBACK_APIS = [
 ];
 
 // Alternatif indirme sunucularını deneyen yardımcı fonksiyon
-function tryCobaltDownload(videoUrl, format) {
+function tryCobaltDownload(videoUrl, format, quality = '1080') {
     return new Promise(async (resolve, reject) => {
         const payload = {
             url: videoUrl,
             audioFormat: format === 'mp3' ? 'mp3' : 'best',
             downloadMode: format === 'mp3' ? 'audio' : 'auto',
-            videoQuality: '1080',
+            videoQuality: quality,
             youtubeVideoCodec: 'h264'
         };
 
@@ -98,7 +101,11 @@ function tryCobaltDownload(videoUrl, format) {
 
 // Dosya isminde hata yaratabilecek karakterleri temizleme fonksiyonu
 function sanitizeFilename(name) {
-    return name.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    // Windows ve Linux dosya sistemleri için geçersiz karakterleri temizle (\ / : * ? " < > |)
+    let cleanName = name.replace(/[\\/:*?"<>|]/g, '');
+    // Çift boşlukları tek boşluğa düşür ve kenarlardaki boşlukları kırp
+    cleanName = cleanName.replace(/\s+/g, ' ').trim();
+    return cleanName || 'yutup_indir';
 }
 
 // Yerel olarak yt-dlp çalıştıran ham spawn fonksiyonu (Klasör yollarındaki boşluk hatalarını engeller)
@@ -131,6 +138,7 @@ function runYtDlp(url, args) {
 app.get('/api/download', async (req, res) => {
     const videoUrl = req.query.url;
     const format = req.query.format; // 'mp3' or 'mp4'
+    const quality = req.query.quality || '1080'; // '1080', '720', '480', '360'
 
     if (!videoUrl) {
         return res.status(400).send('URL parametresi gereklidir.');
@@ -170,9 +178,9 @@ app.get('/api/download', async (req, res) => {
                 '--no-warnings'
             ];
         } else {
-            // Yüksek kalite HD/4K MP4 (Ses ve görüntüyü birleştirip en yüksek kaliteyi verir)
+            // Dinamik Seçilen Kalitede MP4 (Kullanıcının tercihine göre)
             dlArgs = [
-                '--format', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                '--format', `bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best`,
                 '--merge-output-format', 'mp4',
                 '--output', relativeOutputPath,
                 '--ffmpeg-location', binPath,
@@ -201,7 +209,7 @@ app.get('/api/download', async (req, res) => {
             console.warn('[Sistem] Yerel indirme (yt-dlp) başarısız oldu, alternatif (Cobalt Proxy) deneniyor...', downloadError.message);
             
             try {
-                const cobaltResult = await tryCobaltDownload(videoUrl, format);
+                const cobaltResult = await tryCobaltDownload(videoUrl, format, quality);
                 console.log(`[Sistem] Alternatif indirme akışı başlatılıyor: ${cobaltResult.filename}`);
                 
                 const clientFilename = sanitizeFilename(cobaltResult.filename);
