@@ -161,6 +161,37 @@ app.get('/api/download', async (req, res) => {
         
         const safeTitle = sanitizeFilename(title);
         
+        const isRender = process.env.RENDER === 'true' || process.env.PORT !== undefined;
+
+        // Render sunucusunda çalışıyorsak, CPU limitlerini ve YouTube IP bloklarını
+        // aşmak ve indirmeyi 5 saniyeye düşürmek için doğrudan Cobalt Proxy motorunu öncelikli tetikliyoruz.
+        if (isRender) {
+            console.log(`[Sistem] Sunucu ortamı (Render) tespit edildi. Süper hızlı Cobalt indirme motoru öncelikli olarak tetikleniyor...`);
+            try {
+                const cobaltResult = await tryCobaltDownload(videoUrl, format, quality);
+                console.log(`[Sistem] Cobalt indirme akışı başlatılıyor: ${cobaltResult.filename}`);
+                
+                const clientFilename = sanitizeFilename(cobaltResult.filename);
+                
+                return https.get(cobaltResult.downloadUrl, (cobaltStream) => {
+                    if (cobaltStream.statusCode >= 400) {
+                        return res.status(cobaltStream.statusCode).send('Akış indirme hatası.');
+                    }
+                    
+                    res.setHeader('Content-Disposition', `attachment; filename="${clientFilename || safeTitle}.${format}"`);
+                    res.setHeader('Content-Type', format === 'mp3' ? 'audio/mpeg' : 'video/mp4');
+                    
+                    cobaltStream.pipe(res);
+                }).on('error', (streamErr) => {
+                    console.error('[Sistem] Cobalt akış hatası:', streamErr);
+                    res.status(500).send('İndirme akışı sırasında hata oluştu.');
+                });
+            } catch (cobaltError) {
+                console.warn('[Sistem] Cobalt sunucuda başarısız oldu, yedek yerel yt-dlp motoruna geri dönülüyor...', cobaltError.message);
+                // Çökme durumunda yerel yt-dlp motorunu yedek olarak deneriz.
+            }
+        }
+        
         // Aynı anda çoklu işlemlerde dosya karışıklığını önlemek için benzersiz id
         const uniqueId = Date.now() + '_' + Math.floor(Math.random() * 10000);
         const relativeOutputPath = `${uniqueId}.${format}`;
@@ -172,7 +203,7 @@ app.get('/api/download', async (req, res) => {
             dlArgs = [
                 '--extract-audio',
                 '--audio-format', 'mp3',
-                '--audio-quality', '0',
+                '--audio-quality', '192K', // Süper hızlı transkod için 192kbps (Kayıpsız duyum)
                 '--output', relativeOutputPath,
                 '--ffmpeg-location', binPath,
                 '--no-warnings'
