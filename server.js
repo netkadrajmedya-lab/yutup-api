@@ -4,15 +4,59 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const { spawn } = require('child_process');
-const youtubedlPath = require('youtube-dl-exec').constants.YOUTUBE_DL_PATH;
+const ytDlpBinaryName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+const binPath = path.join(__dirname, 'bin');
+const youtubedlPath = path.join(binPath, ytDlpBinaryName);
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const ffprobeInstaller = require('@ffprobe-installer/ffprobe');
 
 // bin klasörünü oluşturup içlerine ffmpeg ve ffprobe kopyalayalım
 // Bu sayede hem ffmpeg hem de ffprobe aynı klasörde olur ve yt-dlp problemsiz çalışır!
-const binPath = path.join(__dirname, 'bin');
 if (!fs.existsSync(binPath)) {
     fs.mkdirSync(binPath, { recursive: true });
+}
+
+// yt-dlp indirme ve güncelleme fonksiyonu
+async function ensureYtDlp() {
+    return new Promise((resolve) => {
+        if (fs.existsSync(youtubedlPath)) {
+            console.log(`[Sistem] yt-dlp bulunuyor, güncellemeler kontrol ediliyor...`);
+            const child = spawn(youtubedlPath, ['-U']);
+            child.on('close', resolve);
+            child.on('error', resolve);
+            return;
+        }
+
+        console.log(`[Sistem] yt-dlp bulunamadı, en güncel sürüm indiriliyor...`);
+        const isWin = process.platform === 'win32';
+        const url = isWin 
+            ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+            : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+        
+        const file = fs.createWriteStream(youtubedlPath);
+        
+        const handleResponse = (res) => {
+            if (res.statusCode === 301 || res.statusCode === 302) {
+                https.get(res.headers.location, handleResponse).on('error', handleError);
+            } else {
+                res.pipe(file);
+                file.on('finish', () => {
+                    file.close();
+                    if (!isWin) fs.chmodSync(youtubedlPath, 0o755);
+                    console.log(`[Sistem] yt-dlp başarıyla indirildi!`);
+                    resolve();
+                });
+            }
+        };
+
+        const handleError = (err) => {
+            console.error('[Sistem] yt-dlp indirme hatası:', err.message);
+            fs.unlink(youtubedlPath, () => {});
+            resolve(); // Hata olsa da devam et, alternatif API'ler denenebilir
+        };
+
+        https.get(url, handleResponse).on('error', handleError);
+    });
 }
 
 const ffmpegBinaryName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
@@ -320,23 +364,27 @@ app.get('/api/download', async (req, res) => {
 // Masaüstü (Electron) veya diğer modüllerden başlatılabilmesi için fonksiyon
 function startServer() {
     return new Promise((resolve) => {
-        // Port 0 vererek sistemin boş bir port atamasını sağlıyoruz
-        const serverInfo = app.listen(0, () => {
-            const dynamicPort = serverInfo.address().port;
-            console.log(`Arka plan motoru ${dynamicPort} portunda çalışıyor.`);
-            resolve(dynamicPort);
+        ensureYtDlp().then(() => {
+            // Port 0 vererek sistemin boş bir port atamasını sağlıyoruz
+            const serverInfo = app.listen(0, () => {
+                const dynamicPort = serverInfo.address().port;
+                console.log(`Arka plan motoru ${dynamicPort} portunda çalışıyor.`);
+                resolve(dynamicPort);
+            });
         });
     });
 }
 
 // Eğer bu dosya doğrudan çalıştırılırsa (örneğin cPanel'de veya node server.js)
 if (require.main === module) {
-    app.listen(PORT, () => {
-        console.log(`=========================================`);
-        console.log(`🚀 Yutup İndir Web Sunucusu Başlatıldı!`);
-        console.log(`📌 Port: ${PORT}`);
-        console.log(`🌐 Arayüze ulaşmak için: http://localhost:${PORT}`);
-        console.log(`=========================================`);
+    ensureYtDlp().then(() => {
+        app.listen(PORT, () => {
+            console.log(`=========================================`);
+            console.log(`🚀 Yutup İndir Web Sunucusu Başlatıldı!`);
+            console.log(`📌 Port: ${PORT}`);
+            console.log(`🌐 Arayüze ulaşmak için: http://localhost:${PORT}`);
+            console.log(`=========================================`);
+        });
     });
 }
 
